@@ -123,6 +123,26 @@
             opacity: 0;
         }
 
+        #split-btn {
+            position: absolute;
+            right: 130px;
+            top: 50%;
+            transform: translateY(-50%);
+            padding: 8px 15px;
+            background-color: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transition: background 0.2s;
+        }
+
+            #split-btn:hover {
+                background-color: #1976D2;
+            }
+
         #edit-menu {
             display: none;
             position: fixed;
@@ -202,7 +222,8 @@
 
     <div class="header-container">
         <h1>Interactive Map Editor</h1>
-        <p>Scroll to Zoom • Drag to Pan • Click a Country to Edit</p>
+        <p>Scroll to Zoom • Drag to Pan • Click a Country to Edit • ✂ Split to Draw Borders</p>
+        <button id="split-btn">✂ Split Country</button>
         <button id="reset-btn">Reset Map</button>
     </div>
 
@@ -1183,8 +1204,25 @@
 
             let savedMapData = JSON.parse(localStorage.getItem('myMapEdits')) || {};
 
+            // Apply saved splits before path initialization
+            (JSON.parse(localStorage.getItem('myMapSplits')) || []).forEach(split => {
+                const target = Array.from(mapGroup.querySelectorAll('path')).find(p => p.getAttribute('d') === split.targetPathD);
+                if (target) {
+                    const p1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                    p1.setAttribute('d', split.path1D);
+                    p1.setAttribute('name', split.splitId1);
+                    const p2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                    p2.setAttribute('d', split.path2D);
+                    p2.setAttribute('name', split.splitId2);
+                    target.parentNode.insertBefore(p1, target);
+                    target.parentNode.insertBefore(p2, target);
+                    target.parentNode.removeChild(target);
+                }
+            });
+
             let currentScale = 1, currentX = 0, currentY = 0;
             let isDragging = false, isPanning = false, startX, startY;
+            let splitMode = false;
 
             function updateTransform() {
                 mapGroup.style.transform = `translate(${currentX}px, ${currentY}px) scale(${currentScale})`;
@@ -1195,7 +1233,7 @@
             mapContainer.addEventListener('mousedown', (e) => {
                 isDragging = true; isPanning = false;
                 startX = e.clientX - currentX; startY = e.clientY - currentY;
-                mapContainer.style.cursor = "grabbing";
+                if (!splitMode) mapContainer.style.cursor = "grabbing";
             });
 
             window.addEventListener('mousemove', (e) => {
@@ -1211,7 +1249,7 @@
 
             window.addEventListener('mouseup', () => {
                 isDragging = false;
-                mapContainer.style.cursor = "grab";
+                if (!splitMode) mapContainer.style.cursor = "grab";
                 if (isPanning) {
                     updateLabels();
                     setTimeout(() => { isPanning = false; }, 50);
@@ -1389,7 +1427,7 @@
             });
 
             mapGroup.addEventListener('click', (e) => {
-                if (isPanning) return;
+                if (isPanning || splitMode) return;
                 if (e.target.tagName === 'path' || e.target.tagName === 'circle') {
                     const countryId = e.target.getAttribute('data-country-id');
                     const originalId = e.target.getAttribute('data-original-id');
@@ -1400,6 +1438,7 @@
             document.getElementById('reset-btn').addEventListener('click', () => {
                 if (confirm("Are you sure you want to delete all saved changes and reset the map?")) {
                     localStorage.removeItem('myMapEdits');
+                    localStorage.removeItem('myMapSplits');
                     location.reload();
                 }
             });
@@ -1436,18 +1475,15 @@
                     const newName = nameInput.value;
                     const newColor = colorInput.value;
 
-                    savedMapData[activeOriginalId] = {
-                        name: newName,
-                        color: newColor
-                    };
-                    localStorage.setItem('myMapEdits', JSON.stringify(savedMapData));
-
                     countryGroups[activeCountryId].forEach(el => {
+                        const origId = el.getAttribute('data-original-id');
+                        savedMapData[origId] = { name: newName, color: newColor };
                         el.style.fill = newColor;
                         el.setAttribute('data-country-id', newName);
                     });
+                    localStorage.setItem('myMapEdits', JSON.stringify(savedMapData));
 
-                    const label = labelsList.find(l => l.getAttribute('data-original-id') === activeOriginalId);
+                    const label = labelsList.find(l => l.getAttribute('data-country-ref') === activeCountryId);
                     if (label) {
                         label.textContent = newName;
                         label.setAttribute('data-country-ref', newName);
@@ -1457,6 +1493,7 @@
 
                     if (newName !== activeCountryId) {
                         countryGroups[newName] = countryGroups[activeCountryId];
+                        delete countryGroups[activeCountryId];
                     }
                 }
                 closeMenu();
@@ -1479,6 +1516,392 @@
                 const b = parseInt(hex.substr(4, 2), 16);
                 const yiq = ((r * 299) + (g * 587) + (b * 114)) / 1000;
                 return yiq >= 128 ? 'theme-light' : 'theme-dark';
+            }
+
+            // ===== SPLIT COUNTRY FEATURE =====
+
+            let splitPoints = [];
+            let splitPreviewLine = null;
+            let splitDots = [];
+            const splitBtn = document.getElementById('split-btn');
+
+            function clientToSVG(clientX, clientY) {
+                const svg = document.getElementById('world-map');
+                const pt = svg.createSVGPoint();
+                pt.x = clientX;
+                pt.y = clientY;
+                return pt.matrixTransform(mapGroup.getScreenCTM().inverse());
+            }
+
+            function enterSplitMode() {
+                splitMode = true;
+                splitPoints = [];
+                splitBtn.textContent = 'Cancel Split';
+                splitBtn.style.backgroundColor = '#f44336';
+                mapContainer.style.cursor = 'crosshair';
+
+                splitPreviewLine = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+                splitPreviewLine.setAttribute("fill", "none");
+                splitPreviewLine.setAttribute("stroke", "#ff0000");
+                splitPreviewLine.setAttribute("stroke-width", "2");
+                splitPreviewLine.setAttribute("stroke-dasharray", "6,3");
+                splitPreviewLine.setAttribute("vector-effect", "non-scaling-stroke");
+                splitPreviewLine.style.pointerEvents = "none";
+                mapGroup.appendChild(splitPreviewLine);
+            }
+
+            function exitSplitMode() {
+                splitMode = false;
+                splitBtn.textContent = '\u2702 Split Country';
+                splitBtn.style.backgroundColor = '#2196F3';
+                mapContainer.style.cursor = 'grab';
+                splitPoints = [];
+                if (splitPreviewLine && splitPreviewLine.parentNode) {
+                    splitPreviewLine.parentNode.removeChild(splitPreviewLine);
+                }
+                splitPreviewLine = null;
+                splitDots.forEach(dot => { if (dot.parentNode) dot.parentNode.removeChild(dot); });
+                splitDots = [];
+            }
+
+            splitBtn.addEventListener('click', () => {
+                if (splitMode) exitSplitMode();
+                else enterSplitMode();
+            });
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && splitMode) exitSplitMode();
+            });
+
+            function addSplitDot(svgPt) {
+                const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                dot.setAttribute("cx", svgPt.x);
+                dot.setAttribute("cy", svgPt.y);
+                dot.setAttribute("r", 3 / currentScale);
+                dot.setAttribute("fill", "#ff0000");
+                dot.setAttribute("stroke", "#ffffff");
+                dot.setAttribute("stroke-width", "1");
+                dot.setAttribute("vector-effect", "non-scaling-stroke");
+                dot.style.pointerEvents = "none";
+                mapGroup.appendChild(dot);
+                splitDots.push(dot);
+            }
+
+            mapContainer.addEventListener('click', (e) => {
+                if (!splitMode || isPanning) return;
+                const svgPt = clientToSVG(e.clientX, e.clientY);
+                splitPoints.push({ x: svgPt.x, y: svgPt.y });
+                addSplitDot(svgPt);
+                if (splitPreviewLine) {
+                    splitPreviewLine.setAttribute('points', splitPoints.map(p => `${p.x},${p.y}`).join(' '));
+                }
+            });
+
+            mapContainer.addEventListener('mousemove', (e) => {
+                if (!splitMode || splitPoints.length === 0 || !splitPreviewLine || isDragging) return;
+                const svgPt = clientToSVG(e.clientX, e.clientY);
+                const allPts = [...splitPoints, { x: svgPt.x, y: svgPt.y }];
+                splitPreviewLine.setAttribute('points', allPts.map(p => `${p.x},${p.y}`).join(' '));
+            });
+
+            mapContainer.addEventListener('dblclick', (e) => {
+                if (!splitMode) return;
+                e.preventDefault();
+                // Remove duplicate point from double-click's second single-click
+                if (splitPoints.length >= 2) {
+                    const last = splitPoints[splitPoints.length - 1];
+                    const prev = splitPoints[splitPoints.length - 2];
+                    if (Math.abs(last.x - prev.x) < 1 && Math.abs(last.y - prev.y) < 1) {
+                        splitPoints.pop();
+                        if (splitDots.length > 0) {
+                            const dot = splitDots.pop();
+                            if (dot.parentNode) dot.parentNode.removeChild(dot);
+                        }
+                    }
+                }
+                if (splitPoints.length >= 2) performSplit();
+            });
+
+            // --- Geometry utilities ---
+
+            function pathToPolygon(pathEl, numSamples) {
+                const totalLen = pathEl.getTotalLength();
+                const points = [];
+                for (let i = 0; i < numSamples; i++) {
+                    const pt = pathEl.getPointAtLength((i / numSamples) * totalLen);
+                    points.push({ x: pt.x, y: pt.y });
+                }
+                return points;
+            }
+
+            function segmentIntersection(p1, p2, p3, p4) {
+                const d1x = p2.x - p1.x, d1y = p2.y - p1.y;
+                const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+                const cross = d1x * d2y - d1y * d2x;
+                if (Math.abs(cross) < 1e-10) return null;
+                const t = ((p3.x - p1.x) * d2y - (p3.y - p1.y) * d2x) / cross;
+                const u = ((p3.x - p1.x) * d1y - (p3.y - p1.y) * d1x) / cross;
+                if (t > 1e-6 && t < 1 - 1e-6 && u > 1e-6 && u < 1 - 1e-6) {
+                    return { x: p1.x + t * d1x, y: p1.y + t * d1y, t, u };
+                }
+                return null;
+            }
+
+            function findIntersections(polygon, polyline) {
+                const intersections = [];
+                const n = polygon.length;
+                for (let li = 0; li < polyline.length - 1; li++) {
+                    for (let pi = 0; pi < n; pi++) {
+                        const pNext = (pi + 1) % n;
+                        const hit = segmentIntersection(polyline[li], polyline[li + 1], polygon[pi], polygon[pNext]);
+                        if (hit) {
+                            intersections.push({
+                                point: { x: hit.x, y: hit.y },
+                                lineSegIdx: li, lineT: hit.t,
+                                polyEdgeIdx: pi, polyT: hit.u
+                            });
+                        }
+                    }
+                }
+                intersections.sort((a, b) => a.lineSegIdx !== b.lineSegIdx ? a.lineSegIdx - b.lineSegIdx : a.lineT - b.lineT);
+                const filtered = [];
+                for (const ix of intersections) {
+                    if (filtered.length === 0) { filtered.push(ix); continue; }
+                    const last = filtered[filtered.length - 1];
+                    const dx = ix.point.x - last.point.x, dy = ix.point.y - last.point.y;
+                    if (Math.sqrt(dx * dx + dy * dy) > 0.5) filtered.push(ix);
+                }
+                return filtered;
+            }
+
+            function getDrawnLineBetween(polyline, entry, exit) {
+                const result = [{ x: entry.point.x, y: entry.point.y }];
+                for (let i = entry.lineSegIdx + 1; i <= exit.lineSegIdx; i++) {
+                    result.push({ x: polyline[i].x, y: polyline[i].y });
+                }
+                result.push({ x: exit.point.x, y: exit.point.y });
+                return result;
+            }
+
+            function splitPolygonByLine(polygon, polyline, entry, exit) {
+                const n = polygon.length;
+                const cutLine = getDrawnLineBetween(polyline, entry, exit);
+                const cutReversed = [...cutLine].reverse();
+
+                const polyA = [{ x: entry.point.x, y: entry.point.y }];
+                let idx = (entry.polyEdgeIdx + 1) % n;
+                let target = (exit.polyEdgeIdx + 1) % n;
+                let safety = 0;
+                while (idx !== target && safety++ < n + 1) {
+                    polyA.push({ x: polygon[idx].x, y: polygon[idx].y });
+                    idx = (idx + 1) % n;
+                }
+                polyA.push({ x: exit.point.x, y: exit.point.y });
+                for (let i = 1; i < cutReversed.length - 1; i++) polyA.push(cutReversed[i]);
+
+                const polyB = [{ x: exit.point.x, y: exit.point.y }];
+                idx = (exit.polyEdgeIdx + 1) % n;
+                target = (entry.polyEdgeIdx + 1) % n;
+                safety = 0;
+                while (idx !== target && safety++ < n + 1) {
+                    polyB.push({ x: polygon[idx].x, y: polygon[idx].y });
+                    idx = (idx + 1) % n;
+                }
+                polyB.push({ x: entry.point.x, y: entry.point.y });
+                for (let i = 1; i < cutLine.length - 1; i++) polyB.push(cutLine[i]);
+
+                return [polyA, polyB];
+            }
+
+            function polygonToPathD(points) {
+                if (points.length < 3) return '';
+                let d = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+                for (let i = 1; i < points.length; i++) {
+                    d += ` L ${points[i].x.toFixed(1)} ${points[i].y.toFixed(1)}`;
+                }
+                return d + ' Z';
+            }
+
+            function bboxOverlap(a, b) {
+                return !(a.x + a.width < b.x || b.x + b.width < a.x ||
+                         a.y + a.height < b.y || b.y + b.height < a.y);
+            }
+
+            function createLabelForPath(name, originalId, pathEl) {
+                const bbox = pathEl.getBBox();
+                if (bbox.width * bbox.height < 20) return null;
+                let centerX = bbox.x + bbox.width / 2;
+                let centerY = bbox.y + bbox.height / 2;
+
+                if (pathEl.getTotalLength && pathEl.isPointInFill) {
+                    const perimLen = pathEl.getTotalLength();
+                    const perimPts = [];
+                    for (let i = 0; i < 200; i++) perimPts.push(pathEl.getPointAtLength((i / 200) * perimLen));
+                    const svg = document.getElementById('world-map');
+                    let pt = svg.createSVGPoint();
+                    let maxDist = -1;
+                    const stepX = bbox.width / 40, stepY = bbox.height / 40;
+                    for (let x = bbox.x + stepX / 2; x < bbox.x + bbox.width; x += stepX) {
+                        for (let y = bbox.y + stepY / 2; y < bbox.y + bbox.height; y += stepY) {
+                            pt.x = x; pt.y = y;
+                            if (pathEl.isPointInFill(pt)) {
+                                let minDSq = Infinity;
+                                for (const pp of perimPts) {
+                                    const dx = x - pp.x, dy = y - pp.y;
+                                    const dSq = dx * dx + dy * dy;
+                                    if (dSq < minDSq) minDSq = dSq;
+                                }
+                                if (minDSq > maxDist) { maxDist = minDSq; centerX = x; centerY = y; }
+                            }
+                        }
+                    }
+                }
+
+                const textNode = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                textNode.textContent = name;
+                textNode.setAttribute("x", centerX);
+                textNode.setAttribute("y", centerY);
+                textNode.setAttribute("data-country-ref", name);
+                textNode.setAttribute("data-original-id", originalId);
+                textNode.setAttribute("data-width", bbox.width);
+                textNode.setAttribute("font-size", 16 / currentScale);
+                const fillColor = pathEl.style.fill || '#ffffff';
+                textNode.classList.add(getContrastTheme(fillColor));
+                mapGroup.appendChild(textNode);
+                labelsList.push(textNode);
+                return textNode;
+            }
+
+            function performSplit() {
+                // Clean up duplicate/close points
+                const drawnLine = [splitPoints[0]];
+                for (let i = 1; i < splitPoints.length; i++) {
+                    const dx = splitPoints[i].x - drawnLine[drawnLine.length - 1].x;
+                    const dy = splitPoints[i].y - drawnLine[drawnLine.length - 1].y;
+                    if (Math.sqrt(dx * dx + dy * dy) > 0.5) drawnLine.push(splitPoints[i]);
+                }
+                if (drawnLine.length < 2) {
+                    alert('Please draw a line with at least 2 points.');
+                    exitSplitMode();
+                    return;
+                }
+
+                // Bounding box of drawn line for fast rejection
+                let lMinX = Infinity, lMinY = Infinity, lMaxX = -Infinity, lMaxY = -Infinity;
+                for (const p of drawnLine) {
+                    lMinX = Math.min(lMinX, p.x); lMinY = Math.min(lMinY, p.y);
+                    lMaxX = Math.max(lMaxX, p.x); lMaxY = Math.max(lMaxY, p.y);
+                }
+                const lineBbox = { x: lMinX, y: lMinY, width: lMaxX - lMinX, height: lMaxY - lMinY };
+
+                // Find which path the line crosses
+                const allPaths = mapGroup.querySelectorAll('path');
+                let targetPath = null, intersections = null, polygon = null;
+
+                for (const path of allPaths) {
+                    const pathBbox = path.getBBox();
+                    if (!bboxOverlap(lineBbox, pathBbox)) continue;
+                    const poly = pathToPolygon(path, 1000);
+                    const ixs = findIntersections(poly, drawnLine);
+                    if (ixs.length >= 2) {
+                        targetPath = path;
+                        intersections = ixs;
+                        polygon = poly;
+                        break;
+                    }
+                }
+
+                if (!targetPath) {
+                    alert('The line must cross completely through a country (start and end outside it).');
+                    exitSplitMode();
+                    return;
+                }
+
+                const entry = intersections[0];
+                const exit = intersections[1];
+                const countryId = targetPath.getAttribute('data-country-id');
+                const originalId = targetPath.getAttribute('data-original-id');
+                const currentColor = rgbToHex(window.getComputedStyle(targetPath).fill);
+                const originalD = targetPath.getAttribute('d');
+
+                const [poly1, poly2] = splitPolygonByLine(polygon, drawnLine, entry, exit);
+                const path1D = polygonToPathD(poly1);
+                const path2D = polygonToPathD(poly2);
+
+                if (!path1D || !path2D) {
+                    alert('Split failed. Please try a different line.');
+                    exitSplitMode();
+                    return;
+                }
+
+                const ts = Date.now();
+                const splitId1 = `${originalId}.${ts}.a`;
+                const splitId2 = `${originalId}.${ts}.b`;
+
+                let name2 = countryId + ' (2)';
+                if (countryGroups[name2]) {
+                    let num = 3;
+                    while (countryGroups[countryId + ` (${num})`]) num++;
+                    name2 = countryId + ` (${num})`;
+                }
+
+                // Create new path elements
+                const newPath1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                newPath1.setAttribute('d', path1D);
+                newPath1.setAttribute('name', splitId1);
+                newPath1.setAttribute('data-original-id', splitId1);
+                newPath1.setAttribute('data-country-id', countryId);
+                newPath1.style.fill = currentColor;
+
+                const newPath2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                newPath2.setAttribute('d', path2D);
+                newPath2.setAttribute('name', splitId2);
+                newPath2.setAttribute('data-original-id', splitId2);
+                newPath2.setAttribute('data-country-id', name2);
+                newPath2.style.fill = currentColor;
+
+                const parent = targetPath.parentNode;
+                parent.insertBefore(newPath1, targetPath);
+                parent.insertBefore(newPath2, targetPath);
+                parent.removeChild(targetPath);
+
+                // Update countryGroups
+                if (countryGroups[countryId]) {
+                    const idx = countryGroups[countryId].indexOf(targetPath);
+                    if (idx > -1) countryGroups[countryId].splice(idx, 1);
+                    if (countryGroups[countryId].length === 0) delete countryGroups[countryId];
+                }
+                if (!countryGroups[countryId]) countryGroups[countryId] = [];
+                countryGroups[countryId].push(newPath1);
+                if (!countryGroups[name2]) countryGroups[name2] = [];
+                countryGroups[name2].push(newPath2);
+
+                // Persist edit data for new split IDs
+                savedMapData[splitId1] = { name: countryId, color: currentColor };
+                savedMapData[splitId2] = { name: name2, color: currentColor };
+                localStorage.setItem('myMapEdits', JSON.stringify(savedMapData));
+
+                // Persist split record
+                const savedSplits = JSON.parse(localStorage.getItem('myMapSplits')) || [];
+                savedSplits.push({ targetPathD: originalD, path1D, path2D, splitId1, splitId2 });
+                localStorage.setItem('myMapSplits', JSON.stringify(savedSplits));
+
+                // Remove old label for this country
+                for (let i = labelsList.length - 1; i >= 0; i--) {
+                    const ref = labelsList[i].getAttribute('data-country-ref');
+                    if (ref === countryId) {
+                        const lbl = labelsList[i];
+                        if (lbl.parentNode) lbl.parentNode.removeChild(lbl);
+                        labelsList.splice(i, 1);
+                    }
+                }
+
+                // Create new labels for both halves
+                createLabelForPath(countryId, splitId1, newPath1);
+                createLabelForPath(name2, splitId2, newPath2);
+
+                updateLabels();
+                exitSplitMode();
             }
         });
     </script>
