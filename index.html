@@ -1206,17 +1206,24 @@
 
             // Apply saved splits before path initialization
             (JSON.parse(localStorage.getItem('myMapSplits')) || []).forEach(split => {
-                const target = Array.from(mapGroup.querySelectorAll('path')).find(p => p.getAttribute('d') === split.targetPathD);
-                if (target) {
-                    const p1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
-                    p1.setAttribute('d', split.path1D);
-                    p1.setAttribute('name', split.splitId1);
-                    const p2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
-                    p2.setAttribute('d', split.path2D);
-                    p2.setAttribute('name', split.splitId2);
-                    target.parentNode.insertBefore(p1, target);
-                    target.parentNode.insertBefore(p2, target);
-                    target.parentNode.removeChild(target);
+                if (split.type === 'detach') {
+                    split.detachedPathDs.forEach(d => {
+                        const path = Array.from(mapGroup.querySelectorAll('path')).find(p => p.getAttribute('d') === d);
+                        if (path) path.setAttribute('name', split.splitId);
+                    });
+                } else {
+                    const target = Array.from(mapGroup.querySelectorAll('path')).find(p => p.getAttribute('d') === split.targetPathD);
+                    if (target) {
+                        const p1 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                        p1.setAttribute('d', split.path1D);
+                        p1.setAttribute('name', split.splitId1);
+                        const p2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                        p2.setAttribute('d', split.path2D);
+                        p2.setAttribute('name', split.splitId2);
+                        target.parentNode.insertBefore(p1, target);
+                        target.parentNode.insertBefore(p2, target);
+                        target.parentNode.removeChild(target);
+                    }
                 }
             });
 
@@ -1812,7 +1819,10 @@
                 }
 
                 if (!targetPath) {
-                    alert('The line must cross completely through a country (start and end outside it).');
+                    // Fallback: check if line separates disconnected parts of a multi-path country
+                    if (!tryDetach(drawnLine, lineBbox)) {
+                        alert('The line must cross through a country or separate disconnected parts of one.');
+                    }
                     exitSplitMode();
                     return;
                 }
@@ -1902,6 +1912,135 @@
 
                 updateLabels();
                 exitSplitMode();
+            }
+
+            function tryDetach(drawnLine, lineBbox) {
+                for (const groupName of Object.keys(countryGroups)) {
+                    const paths = countryGroups[groupName];
+                    if (paths.length < 2) continue;
+
+                    // Fast rejection: check bbox overlap with line
+                    let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
+                    const centroids = paths.map(p => {
+                        const bbox = p.getBBox();
+                        gMinX = Math.min(gMinX, bbox.x);
+                        gMinY = Math.min(gMinY, bbox.y);
+                        gMaxX = Math.max(gMaxX, bbox.x + bbox.width);
+                        gMaxY = Math.max(gMaxY, bbox.y + bbox.height);
+                        return { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 };
+                    });
+                    const groupBbox = { x: gMinX, y: gMinY, width: gMaxX - gMinX, height: gMaxY - gMinY };
+                    if (!bboxOverlap(lineBbox, groupBbox)) continue;
+
+                    // Union-Find: group paths whose centroids are NOT separated by the drawn line
+                    const uf = paths.map((_, i) => i);
+                    function find(x) { while (uf[x] !== x) x = uf[x]; return x; }
+                    function union(a, b) { uf[find(a)] = find(b); }
+
+                    for (let i = 0; i < paths.length; i++) {
+                        for (let j = i + 1; j < paths.length; j++) {
+                            let separated = false;
+                            for (let li = 0; li < drawnLine.length - 1; li++) {
+                                if (segmentIntersection(drawnLine[li], drawnLine[li + 1], centroids[i], centroids[j])) {
+                                    separated = true;
+                                    break;
+                                }
+                            }
+                            if (!separated) union(i, j);
+                        }
+                    }
+
+                    const clusters = {};
+                    for (let i = 0; i < paths.length; i++) {
+                        const root = find(i);
+                        if (!clusters[root]) clusters[root] = [];
+                        clusters[root].push(i);
+                    }
+
+                    const clusterKeys = Object.keys(clusters);
+                    if (clusterKeys.length < 2) continue;
+
+                    // Largest cluster keeps the name, rest get detached
+                    clusterKeys.sort((a, b) => clusters[b].length - clusters[a].length);
+                    const keepPaths = clusters[clusterKeys[0]].map(i => paths[i]);
+                    const detachPaths = [];
+                    for (let k = 1; k < clusterKeys.length; k++) {
+                        detachPaths.push(...clusters[clusterKeys[k]].map(i => paths[i]));
+                    }
+
+                    performDetach(groupName, keepPaths, detachPaths);
+                    return true;
+                }
+                return false;
+            }
+
+            function performDetach(groupName, keepPaths, detachPaths) {
+                const countryId = keepPaths[0].getAttribute('data-country-id');
+                const currentColor = rgbToHex(window.getComputedStyle(keepPaths[0]).fill);
+                const ts = Date.now();
+                const detachSplitId = `${groupName}.${ts}.detach`;
+
+                let name2 = countryId + ' (2)';
+                if (countryGroups[name2]) {
+                    let num = 3;
+                    while (countryGroups[countryId + ` (${num})`]) num++;
+                    name2 = countryId + ` (${num})`;
+                }
+
+                // Update detached paths' attributes
+                detachPaths.forEach(p => {
+                    p.setAttribute('data-original-id', detachSplitId);
+                    p.setAttribute('data-country-id', name2);
+                });
+
+                // Update countryGroups
+                countryGroups[countryId] = keepPaths;
+                countryGroups[name2] = detachPaths;
+
+                // Persist edit data
+                keepPaths.forEach(p => {
+                    const origId = p.getAttribute('data-original-id');
+                    savedMapData[origId] = { name: countryId, color: currentColor };
+                });
+                savedMapData[detachSplitId] = { name: name2, color: currentColor };
+                localStorage.setItem('myMapEdits', JSON.stringify(savedMapData));
+
+                // Persist detach record
+                const savedSplits = JSON.parse(localStorage.getItem('myMapSplits')) || [];
+                savedSplits.push({
+                    type: 'detach',
+                    detachedPathDs: detachPaths.map(p => p.getAttribute('d')),
+                    splitId: detachSplitId
+                });
+                localStorage.setItem('myMapSplits', JSON.stringify(savedSplits));
+
+                // Remove old label
+                for (let i = labelsList.length - 1; i >= 0; i--) {
+                    if (labelsList[i].getAttribute('data-country-ref') === countryId) {
+                        const lbl = labelsList[i];
+                        if (lbl.parentNode) lbl.parentNode.removeChild(lbl);
+                        labelsList.splice(i, 1);
+                    }
+                }
+
+                // Create new labels for both groups
+                let largestKeep = null, keepMax = 0;
+                keepPaths.forEach(p => {
+                    const bbox = p.getBBox();
+                    const area = bbox.width * bbox.height;
+                    if (area > keepMax) { keepMax = area; largestKeep = p; }
+                });
+                if (largestKeep) createLabelForPath(countryId, largestKeep.getAttribute('data-original-id'), largestKeep);
+
+                let largestDetach = null, detachMax = 0;
+                detachPaths.forEach(p => {
+                    const bbox = p.getBBox();
+                    const area = bbox.width * bbox.height;
+                    if (area > detachMax) { detachMax = area; largestDetach = p; }
+                });
+                if (largestDetach) createLabelForPath(name2, detachSplitId, largestDetach);
+
+                updateLabels();
             }
         });
     </script>
